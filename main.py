@@ -95,7 +95,6 @@ def analyze_food_image(image_array):
           "food_name": "The specific name of the food shown in the image",
           "food_category": "One of: pork, chicken, vegetable, dairy, poultry, fruits, pastry",
           "food_condition": "One of: fresh, stale, spoiled",
-          "best_before": "Estimated date when the food should be consumed by (YYYY-MM-DD)"
         }
 
         Please be specific and base your analysis on visual indicators.
@@ -125,15 +124,15 @@ def analyze_food_image(image_array):
                     food_info["food_category"] = extract_food_category(response_text)
                 if "food_condition" not in food_info:
                     food_info["food_condition"] = extract_food_condition(response_text)
-                if "best_before" not in food_info:
-                    food_info["best_before"] = estimate_best_before_date(response_text)
+                # if "best_before" not in food_info:
+                #     food_info["best_before"] = estimate_best_before_date(response_text)
             else:
                 # Fallback to extraction methods if JSON parsing fails
                 food_info = {
                     "food_name": extract_food_name(response_text),
                     "food_category": extract_food_category(response_text),
                     "food_condition": extract_food_condition(response_text),
-                    "best_before": estimate_best_before_date(response_text),
+                    # "best_before": estimate_best_before_date(response_text),
                 }
         except json.JSONDecodeError:
             # Fallback to extraction methods if JSON parsing fails
@@ -141,7 +140,7 @@ def analyze_food_image(image_array):
                 "food_name": extract_food_name(response_text),
                 "food_category": extract_food_category(response_text),
                 "food_condition": extract_food_condition(response_text),
-                "best_before": estimate_best_before_date(response_text),
+                # "best_before": estimate_best_before_date(response_text),
             }
 
         # Add date_added field (current date)
@@ -316,36 +315,41 @@ def estimate_best_before_date(text):
     # Logic based on food condition
     text_lower = text.lower()
     if "spoiled" in text_lower or "rotten" in text_lower:
-        # Already spoiled - past date
-        best_before = current_date - timedelta(days=7)
+        # Already spoiled - past date (only adjust days)
+        best_before = datetime(
+            current_date.year, current_date.month, max(1, current_date.day - 7)
+        )
     elif "stale" in text_lower or "not fresh" in text_lower:
         # Stale - consume immediately
         best_before = current_date
     elif "fresh" in text_lower:
-        # Fresh - estimate based on type
+        # Fresh - estimate based on type (only adjust days)
+        days_to_add = 3  # Default
+
         if any(
             food in text_lower
             for food in ["fruit", "fruits", "vegetable", "vegetables", "produce"]
         ):
-            best_before = current_date + timedelta(days=5)
+            days_to_add = 5
         elif any(
             food in text_lower
             for food in ["meat", "pork", "beef", "poultry", "chicken"]
         ):
-            best_before = current_date + timedelta(days=2)
+            days_to_add = 2
         elif any(food in text_lower for food in ["dairy", "milk", "yogurt"]):
-            best_before = current_date + timedelta(days=7)
+            days_to_add = 7
         elif any(food in text_lower for food in ["pastry", "bread", "cake"]):
-            best_before = current_date + timedelta(days=4)
-        else:
-            best_before = current_date + timedelta(days=3)
+            days_to_add = 4
+
+        # Calculate the new date while handling month/year transitions properly
+        best_before = current_date + timedelta(days=days_to_add)
     else:
         best_before = current_date + timedelta(days=3)  # Default
 
     return best_before.strftime("%Y-%m-%d")
 
 
-@app.route("/detect", methods=["POST"])
+@app.route("/detect", methods=["GET"])
 def detect_food():
     """API endpoint to capture a frame from webcam and analyze it"""
     if not initialize_camera():
@@ -373,6 +377,126 @@ def test_connection():
     """Simple endpoint to test if the API is running"""
     return jsonify(
         {"status": "API is running", "timestamp": datetime.now().isoformat()}
+    )
+
+
+@app.route("/analyze_folder", methods=["GET"])
+def analyze_folder():
+    """Analyze all food images in the specified folder"""
+    folder_path = request.args.get("folder", "images")  # Default to 'images' folder
+
+    # Check if folder exists
+    if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
+        return (
+            jsonify(
+                {"error": f"Folder '{folder_path}' not found or is not a directory"}
+            ),
+            404,
+        )
+
+    # Get all image files in the folder
+    image_extensions = [".jpg", ".jpeg", ".png", ".bmp", ".webp"]
+    image_files = [
+        f
+        for f in os.listdir(folder_path)
+        if os.path.isfile(os.path.join(folder_path, f))
+        and os.path.splitext(f)[1].lower() in image_extensions
+    ]
+
+    if not image_files:
+        return jsonify({"error": f"No image files found in '{folder_path}'"}), 404
+
+    # Process each image
+    results = []
+    for img_file in image_files:
+        file_path = os.path.join(folder_path, img_file)
+        try:
+            # Read the image with OpenCV
+            img = cv2.imread(file_path)
+            if img is None:
+                results.append(
+                    {"filename": img_file, "error": "Failed to read image file"}
+                )
+                continue
+
+            # Analyze the image
+            analysis = analyze_food_image(img)
+
+            # Add filename to the result
+            analysis["filename"] = img_file
+            results.append(analysis)
+
+        except Exception as e:
+            results.append(
+                {"filename": img_file, "error": f"Error processing image: {str(e)}"}
+            )
+
+    return jsonify(
+        {"folder": folder_path, "images_processed": len(results), "results": results}
+    )
+
+
+@app.route("/analyze_image/<filename>", methods=["GET"])
+def analyze_single_image(filename):
+    """Analyze a single food image from the images folder"""
+    folder_path = request.args.get("folder", "images")  # Default to 'images' folder
+    file_path = os.path.join(folder_path, filename)
+
+    # Check if file exists
+    if not os.path.exists(file_path) or not os.path.isfile(file_path):
+        return (
+            jsonify({"error": f"Image file '{filename}' not found in '{folder_path}'"}),
+            404,
+        )
+
+    try:
+        # Read the image with OpenCV
+        img = cv2.imread(file_path)
+        if img is None:
+            return jsonify({"error": f"Failed to read image file '{filename}'"}), 500
+
+        # Analyze the image
+        analysis = analyze_food_image(img)
+
+        # Add filename to the result
+        analysis["filename"] = filename
+
+        return jsonify(analysis)
+
+    except Exception as e:
+        return (
+            jsonify(
+                {"filename": filename, "error": f"Error processing image: {str(e)}"}
+            ),
+            500,
+        )
+
+
+@app.route("/list_images", methods=["GET"])
+def list_images():
+    """List all image files in the images folder"""
+    folder_path = request.args.get("folder", "images")  # Default to 'images' folder
+
+    # Check if folder exists
+    if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
+        return (
+            jsonify(
+                {"error": f"Folder '{folder_path}' not found or is not a directory"}
+            ),
+            404,
+        )
+
+    # Get all image files in the folder
+    image_extensions = [".jpg", ".jpeg", ".png", ".bmp", ".webp"]
+    image_files = [
+        f
+        for f in os.listdir(folder_path)
+        if os.path.isfile(os.path.join(folder_path, f))
+        and os.path.splitext(f)[1].lower() in image_extensions
+    ]
+
+    return jsonify(
+        {"folder": folder_path, "image_count": len(image_files), "images": image_files}
     )
 
 
