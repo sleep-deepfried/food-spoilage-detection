@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify
 from google import genai
 import PIL.Image
 import os
@@ -9,28 +9,16 @@ import psycopg2
 from psycopg2.extras import DictCursor
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
-import uuid
-from functools import wraps
-import logging
-
-# Set up logging
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", os.urandom(24))  # Add secret key for sessions
-
 # Initialize the Gemini client
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 # Global camera variable
 camera = None
-
-# In-memory temporary storage for detection results with timestamp
-detection_cache = {}
 
 # Database configuration
 DB_HOST = os.getenv("DB_HOST")
@@ -110,7 +98,7 @@ def analyze_food_image(image_array):
         {
           "food_name": "The specific name of the food shown in the image IN FILIPINO language (e.g., Adobo, Sinigang, Lechon, Pancit). If not a Filipino dish, provide the closest Filipino equivalent or translation.",
           "english_name": "The English name or closest equivalent of the food",
-          "food_category": "One of: pork, chicken, vegetable, dairy, poultry, fruits, pastry", 
+          "food_category": "One of: pork, chicken, vegetable, dairy, poultry, fruits, pastry",
           "food_condition": "One of: fresh, spoiled"
         }
         
@@ -148,8 +136,6 @@ def analyze_food_image(image_array):
 
             # Add date_added field
             food_info["date_added"] = datetime.now().strftime("%Y-%m-%d")
-            # Set timestamp for cache management
-            food_info["timestamp"] = datetime.now().isoformat()
             # Set confidence to high if we got a proper detection
             food_info["confidence"] = (
                 0.95 if food_info["food_name"] != "hindi kilala" else 0.1
@@ -164,7 +150,6 @@ def analyze_food_image(image_array):
                 "food_category": "unknown",
                 "food_condition": "unknown",
                 "date_added": datetime.now().strftime("%Y-%m-%d"),
-                "timestamp": datetime.now().isoformat(),
                 "confidence": 0.1,
                 "error": "Could not parse response",
             }
@@ -312,63 +297,6 @@ def remove_food_from_db(food_data, quantity=1):
         if conn:
             conn.close()
 
-
-def requires_detection(f):
-    """Decorator to ensure detection was done first"""
-
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        # Log all request data for debugging
-        logger.debug(f"Request headers: {request.headers}")
-        logger.debug(f"Request form: {request.form}")
-        logger.debug(f"Request JSON: {request.get_json(silent=True)}")
-        logger.debug(f"Current detection cache keys: {list(detection_cache.keys())}")
-
-        # Try to get detection_id from different sources
-        detection_id = None
-
-        # Check if JSON in request
-        if request.is_json:
-            detection_id = request.json.get("detection_id")
-
-        # If not found in JSON, check form data
-        if not detection_id and request.form:
-            detection_id = request.form.get("detection_id")
-
-        # If still not found, check query parameters
-        if not detection_id:
-            detection_id = request.args.get("detection_id")
-
-        logger.debug(f"Extracted detection_id: {detection_id}")
-
-        if not detection_id:
-            return (
-                jsonify(
-                    {
-                        "error": "No detection ID provided. Please include 'detection_id' in your request.",
-                        "status": "error",
-                    }
-                ),
-                400,
-            )
-
-        if detection_id not in detection_cache:
-            return (
-                jsonify(
-                    {
-                        "error": "No valid detection found. Please use /detect endpoint first.",
-                        "status": "error",
-                        "available_ids": list(detection_cache.keys()),  # For debugging
-                    }
-                ),
-                400,
-            )
-
-        return f(*args, **kwargs)
-
-    return decorated_function
-
-
 @app.route("/detect", methods=["POST"])
 def detect_food():
     """API endpoint to capture a frame from webcam and analyze it"""
@@ -379,107 +307,51 @@ def detect_food():
             ),
             500,
         )
-
+    
     # Capture a frame
     frame = get_frame()
+    # Close the camera after taking the picture
+    release_camera()
     if frame is None:
         return jsonify({"error": "Failed to capture image from webcam."}), 500
-
+    
     # Analyze the captured frame
     result = analyze_food_image(frame)
+    
+    # Return analysis result
+    return jsonify(result)
 
-    # Generate a unique ID for this detection
-    detection_id = str(uuid.uuid4())
-    logger.debug(f"Generated new detection_id: {detection_id}")
-
-    # Store the result in the cache
-    detection_cache[detection_id] = result
-    logger.debug(
-        f"Detection cache updated. Current keys: {list(detection_cache.keys())}"
-    )
-
-    # Add detection_id to the result
-    result["detection_id"] = detection_id
-
-    # Create a proper response structure with detections array
-    response = {
-        "status": "success",
-        "detections": [
-            # Include the current detection
-            result
-        ],
-    }
-
-    # If you want to include previous detections (optional, limited to most recent 5)
-    # This shows most recent detections first
-    previous_detections = []
-    for prev_id, prev_data in list(detection_cache.items())[-5:]:
-        if prev_id != detection_id:  # Don't duplicate the current detection
-            prev_data_copy = prev_data.copy()
-            prev_data_copy["detection_id"] = prev_id
-            previous_detections.append(prev_data_copy)
-
-    # Add previous detections to the response if there are any
-    if previous_detections:
-        response["detections"].extend(previous_detections)
-
-    # Return analysis result with all detections
-    return jsonify(response)
-
-
-@app.route("/detection_status", methods=["GET"])
-def detection_status():
-    """API endpoint to check detection cache status (for debugging)"""
-    return jsonify(
-        {
-            "detection_cache_size": len(detection_cache),
-            "detection_ids": list(detection_cache.keys()),
-        }
-    )
-
-
-@app.route("/add", methods=["POST", "GET"])
-@requires_detection
+@app.route("/add", methods=["POST"])
 def add_food():
     """API endpoint to add food to inventory"""
     try:
-        # Get detection_id from various sources
-        detection_id = None
-        quantity = 1
-
+        # Get food data from request
         if request.is_json:
-            data = request.json
-            detection_id = data.get("detection_id")
-            quantity = data.get("quantity", 1)
-        elif request.form:
-            detection_id = request.form.get("detection_id")
-            quantity = int(request.form.get("quantity", 1))
+            food_data = request.json
         else:
-            detection_id = request.args.get("detection_id")
-            quantity = int(request.args.get("quantity", 1))
+           # If no JSON provided, try to detect the food
+            try:
+                if not initialize_camera():
+                    return jsonify({"error": "Camera not available"}), 500
+    
+                frame = get_frame()
+                if frame is None:
+                    return jsonify({"error": "Failed to capture image"}), 500
+    
+                food_data = analyze_food_image(frame)
+            finally:
+                # Close the camera after taking the picture
+                release_camera()
 
-        # Get food data from the detection cache
-        food_data = detection_cache.get(detection_id, {})
-        if not food_data:
-            return (
-                jsonify({"error": "Detection data not found", "status": "error"}),
-                404,
-            )
-
-        # Log the data we're using
-        logger.debug(f"Using detection_id: {detection_id}")
-        logger.debug(f"Food data: {food_data}")
-        logger.debug(f"Quantity: {quantity}")
+        # Extract quantity if provided, default to 1
+        quantity = (
+            food_data.pop("quantity", 1)
+            if isinstance(food_data, dict) and "quantity" in food_data
+            else 1
+        )
 
         # Add food to database
         result = add_food_to_db(food_data, quantity)
-
-        # Clean up the cache after successful operation
-        if result.get("status") not in ["error"]:
-            detection_cache.pop(detection_id, None)
-            logger.debug(
-                f"Detection {detection_id} removed from cache after successful add"
-            )
 
         return jsonify(
             {
@@ -491,52 +363,40 @@ def add_food():
         )
 
     except Exception as e:
-        logger.exception("Error in add_food endpoint")
-        return jsonify({"error": str(e), "status": "error"}), 500
+        return jsonify({"error": str(e)}), 500
 
 
-@app.route("/remove", methods=["POST", "GET"])
-@requires_detection
+@app.route("/remove", methods=["POST"])
 def remove_food():
     """API endpoint to remove food from inventory"""
     try:
-        # Get detection_id from various sources
-        detection_id = None
-        quantity = 1
-
+        # Get food data from request
         if request.is_json:
-            data = request.json
-            detection_id = data.get("detection_id")
-            quantity = data.get("quantity", 1)
-        elif request.form:
-            detection_id = request.form.get("detection_id")
-            quantity = int(request.form.get("quantity", 1))
+            food_data = request.json
         else:
-            detection_id = request.args.get("detection_id")
-            quantity = int(request.args.get("quantity", 1))
+           # If no JSON provided, try to detect the food
+            try:
+                if not initialize_camera():
+                    return jsonify({"error": "Camera not available"}), 500
+    
+                frame = get_frame()
+                if frame is None:
+                    return jsonify({"error": "Failed to capture image"}), 500
+    
+                food_data = analyze_food_image(frame)
+            finally:
+                # Close the camera after taking the picture
+                release_camera()
 
-        # Get food data from the detection cache
-        food_data = detection_cache.get(detection_id, {})
-        if not food_data:
-            return (
-                jsonify({"error": "Detection data not found", "status": "error"}),
-                404,
-            )
-
-        # Log the data we're using
-        logger.debug(f"Using detection_id: {detection_id}")
-        logger.debug(f"Food data: {food_data}")
-        logger.debug(f"Quantity: {quantity}")
+        # Extract quantity if provided, default to 1
+        quantity = (
+            food_data.pop("quantity", 1)
+            if isinstance(food_data, dict) and "quantity" in food_data
+            else 1
+        )
 
         # Remove food from database
         result = remove_food_from_db(food_data, quantity)
-
-        # Clean up the cache after successful operation
-        if result.get("status") not in ["error"]:
-            detection_cache.pop(detection_id, None)
-            logger.debug(
-                f"Detection {detection_id} removed from cache after successful remove"
-            )
 
         return jsonify(
             {
@@ -548,19 +408,14 @@ def remove_food():
         )
 
     except Exception as e:
-        logger.exception("Error in remove_food endpoint")
-        return jsonify({"error": str(e), "status": "error"}), 500
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/test", methods=["GET"])
 def test_connection():
     """Simple endpoint to test if the API is running"""
     return jsonify(
-        {
-            "status": "API is running",
-            "timestamp": datetime.now().isoformat(),
-            "detection_cache_size": len(detection_cache),
-        }
+        {"status": "API is running", "timestamp": datetime.now().isoformat()}
     )
 
 
@@ -572,6 +427,6 @@ def cleanup(exception=None):
 
 if __name__ == "__main__":
     try:
-        app.run(host="0.0.0.0", port=5000, debug=True)
+        app.run(debug=True)
     finally:
         release_camera()
